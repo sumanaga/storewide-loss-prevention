@@ -55,6 +55,7 @@ async def extract_poses(
     poses: list[Pose] = []
     frame_images = [f[0] for f in frames]
     frame_timestamps = [f[1] for f in frames]
+    prev_center: tuple[float, float] | None = None
 
     logger.info(
         "Entity %s: running YOLO-Pose pipeline (%d frames)",
@@ -69,10 +70,28 @@ async def extract_poses(
             logger.debug("Entity %s: frame %d — no person detected", entity_id, i + 1)
             continue
 
-        # Take the highest-confidence detection (largest person, typically)
-        # YOLO output is sorted by score after NMS.
-        kp_xy = kp_result.xy[0]    # (17, 2)
-        kp_conf = kp_result.conf[0]  # (17,)
+        # Select the best detection: if multiple persons, use spatial
+        # continuity with previous frame to track the same person.
+        num_detections = kp_result.xy.shape[0]
+        if num_detections > 1 and prev_center is not None:
+            # Pick detection whose torso center is closest to previous frame
+            best_idx = 0
+            best_dist = float("inf")
+            for d in range(num_detections):
+                det_xy = kp_result.xy[d]
+                # Torso center = midpoint of shoulders and hips
+                center_x = (det_xy[5][0] + det_xy[6][0] + det_xy[11][0] + det_xy[12][0]) / 4
+                center_y = (det_xy[5][1] + det_xy[6][1] + det_xy[11][1] + det_xy[12][1]) / 4
+                dist = (center_x - prev_center[0]) ** 2 + (center_y - prev_center[1]) ** 2
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = d
+            det_idx = best_idx
+        else:
+            det_idx = 0
+
+        kp_xy = kp_result.xy[det_idx]    # (17, 2)
+        kp_conf = kp_result.conf[det_idx]  # (17,)
         mean_conf = float(kp_conf.mean())
 
         if mean_conf < conf_threshold:
@@ -82,10 +101,21 @@ async def extract_poses(
             )
             continue
 
+        # Extract person bounding box (x1, y1, x2, y2) for VLM cropping
+        bbox_arr = kp_result.boxes[det_idx]  # (4,)
+        bbox = (int(bbox_arr[0]), int(bbox_arr[1]), int(bbox_arr[2]), int(bbox_arr[3]))
+
+        # Update tracking center for next frame
+        prev_center = (
+            float((kp_xy[5][0] + kp_xy[6][0] + kp_xy[11][0] + kp_xy[12][0]) / 4),
+            float((kp_xy[5][1] + kp_xy[6][1] + kp_xy[11][1] + kp_xy[12][1]) / 4),
+        )
+
         pose = Pose(
             keypoints=np.array(kp_xy),
             confidences=np.array(kp_conf),
             timestamp=frame_timestamps[i] if i < len(frame_timestamps) else None,
+            bbox=bbox,
         )
         poses.append(pose)
 

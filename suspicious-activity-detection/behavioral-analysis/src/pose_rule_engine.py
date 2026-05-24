@@ -207,7 +207,14 @@ class PoseRuleEngine:
         if not phases:
             return EngineResult(matched=False, confidence=0.0, description="No phases defined")
 
+        # Allow per-pattern confidence override (stricter than global)
+        pattern_min_conf = pose_cfg.get("min_pose_confidence")
+        saved_min_conf = self.min_confidence
+        if pattern_min_conf and pattern_min_conf > self.min_confidence:
+            self.min_confidence = pattern_min_conf
+
         if len(poses) < min_frames:
+            self.min_confidence = saved_min_conf
             return EngineResult(
                 matched=False, confidence=0.0,
                 description=f"Not enough frames: {len(poses)}/{min_frames}",
@@ -216,19 +223,28 @@ class PoseRuleEngine:
         per_side = pose_cfg.get("per_side", False)
         window_size = pose_cfg.get("window_size", None)
 
-        if per_side:
-            # Try left side, then right side — return first match
-            for side in ("left", "right"):
-                result = self._evaluate_with_side(poses, phases, window_size, side)
-                if result.matched:
-                    result.description = f"[{side}] {result.description}"
-                    return result
-            return EngineResult(
-                matched=False, confidence=0.0,
-                description="Pattern not detected (tried both sides)",
-            )
-        else:
-            return self._evaluate_with_side(poses, phases, window_size, side=None)
+        try:
+            if per_side:
+                # Try both sides and return the highest confidence match
+                best_result: Optional[EngineResult] = None
+                best_side: Optional[str] = None
+                for side in ("left", "right"):
+                    result = self._evaluate_with_side(poses, phases, window_size, side)
+                    if result.matched:
+                        if best_result is None or result.confidence > best_result.confidence:
+                            best_result = result
+                            best_side = side
+                if best_result is not None:
+                    best_result.description = f"[{best_side}] {best_result.description}"
+                    return best_result
+                return EngineResult(
+                    matched=False, confidence=0.0,
+                    description="Pattern not detected (tried both sides)",
+                )
+            else:
+                return self._evaluate_with_side(poses, phases, window_size, side=None)
+        finally:
+            self.min_confidence = saved_min_conf
 
     def _evaluate_with_side(
         self,

@@ -3,20 +3,19 @@
 """
 MQTT-based queue consumer for Behavioral Analysis.
 
-The BA service is fully event-driven and single-shot:
+Uses an in-memory visit cache to accumulate poses incrementally across
+multiple ba/requests for the same visit.  Only NEW frames (those with a
+timestamp newer than the last processed) are sent through YOLO-Pose;
+pattern confidence is evaluated over the full growing window.
 
-* swlp-service publishes one ``ba/requests`` message after each capture
-  cycle (5 frames stored in the ``behavioral-frames`` bucket).
-* For every request we fetch the frames for that visit ONCE, run pose +
-  VLM, and publish exactly one ``ba/results`` message.
-* There is no ``start``/``exit`` lifecycle, no polling worker, and no
-  watermark state on the BA side. Visit lifecycle is owned entirely by
-  the swlp-service ``BAVisitTracker``.
+Once a visit triggers a "suspicious" alert, subsequent requests for the
+same visit immediately re-publish "suspicious" without re-running inference.
 """
 
 import asyncio
 import json
 import logging
+import time
 from typing import Optional
 
 from vlm_metrics_logger import log_ovms_performance_metric
@@ -25,6 +24,7 @@ import paho.mqtt.client as mqtt
 
 from config import Settings
 from pose_analyzer import PatternResult
+from visit_cache import EntityVisitCache
 from yolo_pipeline import extract_poses
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,11 @@ class BAQueueConsumer:
         self._inflight_entities: set[str] = set()
         # Max concurrent analysis tasks to bound memory usage.
         self._max_inflight = max(1, int(getattr(settings, "max_inflight_analyses", 3)))
+
+        # Visit cache: accumulates poses across requests for the same visit.
+        self._visit_cache = EntityVisitCache(max_age_seconds=300.0)
+        self._last_cache_cleanup = time.time()
+
     def initialize(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
         self.client = mqtt.Client(client_id="ba-queue-consumer")
@@ -184,7 +189,34 @@ class BAQueueConsumer:
         self, person_id: str, region_id: str, entry_timestamp: str,
         scene_id: str, last_frame_ts: str,
     ) -> None:
-        """Fetch frames for this visit ONCE, analyse, publish one result."""
+        """Incremental analysis: only process new frames, accumulate poses."""
+        # Periodic stale-entry cleanup (every 60s).
+        now = time.time()
+        if now - self._last_cache_cleanup > 60:
+            self._visit_cache.cleanup_stale()
+            self._last_cache_cleanup = now
+
+        visit = self._visit_cache.get_or_create(person_id, region_id, entry_timestamp)
+        visit.request_count += 1
+
+        # Fast path: already alerted for this visit — re-publish immediately.
+        if visit.alerted:
+            logger.info(
+                "Entity %s: visit already alerted (conf=%.3f), re-publishing suspicious",
+                person_id, visit.alert_confidence,
+            )
+            self.publish_result({
+                "person_id": person_id, "region_id": region_id,
+                "entry_timestamp": entry_timestamp, "scene_id": scene_id,
+                "last_frame_ts": last_frame_ts,
+                "status": "suspicious",
+                "confidence": visit.alert_confidence,
+                "vlm_response": visit.alert_vlm_response,
+                "frames_analyzed": len(visit.poses),
+            })
+            return
+
+        # Fetch frames from SeaweedFS.
         try:
             frames = await self.frame_store.get_frames(
                 entity_id=person_id,
@@ -205,45 +237,76 @@ class BAQueueConsumer:
             })
             return
 
-        frames_available = len(frames)
-        if frames_available < self.min_frames:
+        # Filter to only NEW frames (timestamp > last processed).
+        new_frames = [
+            (img, ts) for img, ts in frames if ts > visit.last_processed_ts
+        ]
+
+        if not new_frames:
+            # No new data since last analysis — respond with current state.
+            self.publish_result({
+                "person_id": person_id, "region_id": region_id,
+                "entry_timestamp": entry_timestamp, "scene_id": scene_id,
+                "last_frame_ts": last_frame_ts,
+                "status": "no_match",
+                "confidence": 0.0,
+                "vlm_response": None,
+                "frames_analyzed": len(visit.poses),
+            })
+            return
+
+        # Check minimum frames (first request for this visit).
+        total_available = len(visit.poses) + len(new_frames)
+        if total_available < self.min_frames and visit.request_count <= 1:
             self.publish_result({
                 "person_id": person_id, "region_id": region_id,
                 "entry_timestamp": entry_timestamp, "scene_id": scene_id,
                 "last_frame_ts": last_frame_ts,
                 "status": "no_enough_data", "confidence": 0.0,
-                "vlm_response": None, "frames_analyzed": frames_available,
+                "vlm_response": None, "frames_analyzed": total_available,
             })
             return
 
-        await self._analyze_batch(
+        # Run YOLO-Pose only on new frames (incremental).
+        await self._analyze_incremental(
             person_id, region_id, entry_timestamp, scene_id,
-            frames, last_frame_ts=last_frame_ts,
+            new_frames, visit, last_frame_ts, all_frames=frames,
         )
 
-    # ---- single-batch analysis -----------------------------------------------
+    # ---- incremental analysis --------------------------------------------------
 
-    async def _analyze_batch(
+    async def _analyze_incremental(
         self, person_id: str, region_id: str, entry_timestamp: str,
-        scene_id: str, frames: list, last_frame_ts: str = "",
+        scene_id: str, new_frames: list, visit, last_frame_ts: str,
+        all_frames: list,
     ) -> None:
-        """Run pose + VLM on a batch of frames and publish exactly one result."""
-        frames_available = len(frames)
+        """Run YOLO on new frames, merge with cached poses, evaluate pattern."""
         try:
-            pose_frames = frames[-self.settings.pose_frames_count:]
-            poses = await extract_poses(pose_frames, person_id, self.settings)
+            new_poses = await extract_poses(new_frames, person_id, self.settings)
 
-            if not poses:
+            # Update cache with new poses and watermark.
+            if new_poses:
+                visit.poses.extend(new_poses)
+            visit.last_processed_ts = max(ts for _, ts in new_frames)
+
+            logger.info(
+                "Entity %s: +%d new poses (total cached: %d, request #%d)",
+                person_id, len(new_poses), len(visit.poses), visit.request_count,
+            )
+
+            # Need minimum poses to evaluate pattern.
+            if len(visit.poses) < self.min_frames:
                 self.publish_result({
                     "person_id": person_id, "region_id": region_id,
                     "entry_timestamp": entry_timestamp, "scene_id": scene_id,
                     "last_frame_ts": last_frame_ts,
-                    "status": "no_match", "confidence": 0.0,
-                    "vlm_response": None, "frames_analyzed": frames_available,
+                    "status": "no_enough_data", "confidence": 0.0,
+                    "vlm_response": None, "frames_analyzed": len(visit.poses),
                 })
                 return
 
-            results = self.pose_analyzer.detect_all_patterns(poses)
+            # Evaluate patterns over the FULL accumulated pose window.
+            results = self.pose_analyzer.detect_all_patterns(visit.poses)
             matched = [r for r in results if r.matched]
             result = (
                 max(matched, key=lambda r: r.confidence)
@@ -257,10 +320,39 @@ class BAQueueConsumer:
             )
 
             if result.matched:
-                logger.warning(
-                    f"Entity {person_id}: pose pattern matched "
-                    f"(confidence={result.confidence:.3f}), calling VLM"
+                pattern_cfg = self.pose_analyzer.pattern_config.get(result.pattern_id, {})
+                min_conf_for_alert = pattern_cfg.get("pose", {}).get(
+                    "min_confidence_for_alert", 0.55
                 )
+
+                # Track peak confidence across the visit (prevents dilution).
+                visit.peak_confidence = max(visit.peak_confidence, result.confidence)
+
+                logger.warning(
+                    "Entity %s: pose pattern matched "
+                    "(confidence=%.3f, peak=%.3f, threshold=%.3f, window=%d poses)",
+                    person_id, result.confidence, visit.peak_confidence,
+                    min_conf_for_alert, len(visit.poses),
+                )
+
+                if visit.peak_confidence < min_conf_for_alert:
+                    logger.info(
+                        "Entity %s: peak confidence %.3f < %.3f, not alerting yet",
+                        person_id, visit.peak_confidence, min_conf_for_alert,
+                    )
+                    self.publish_result({
+                        "person_id": person_id, "region_id": region_id,
+                        "entry_timestamp": entry_timestamp, "scene_id": scene_id,
+                        "last_frame_ts": last_frame_ts,
+                        "status": "no_match",
+                        "confidence": visit.peak_confidence,
+                        "vlm_response": None,
+                        "frames_analyzed": len(visit.poses),
+                    })
+                    return
+
+                # VLM confirmation (supplementary — alert is based on pose).
+                vlm_response = None
                 if self.settings.vlm_enabled and self.pose_analyzer.vlm_client:
                     # Timeout on semaphore wait so one hung VLM call
                     # doesn't block all other entities from progressing.
@@ -278,42 +370,30 @@ class BAQueueConsumer:
                     if acquired:
                         try:
                             result = await self.pose_analyzer.analyze_with_vlm(
-                                frames=pose_frames,
+                                frames=all_frames,
                                 pose_result=result,
-                            )
+                                poses=visit.poses,
+                        )
                         finally:
                             self._vlm_sem.release()
                     if result.vlm_metrics:
-                        log_ovms_performance_metric(
-                            "USECASE_1", result.vlm_metrics
-                        )
-                vlm_response = None
-                if result.vlm_result:
-                    vlm_response = result.vlm_result.get("reasoning")
+                        log_ovms_performance_metric("USECASE_1", result.vlm_metrics)
+                    if result.vlm_result:
+                        vlm_response = result.vlm_result.get("reasoning")
 
-                if result.vlm_confirmed is True:
-                    self.publish_result({
-                        "person_id": person_id, "region_id": region_id,
-                        "entry_timestamp": entry_timestamp, "scene_id": scene_id,
-                        "last_frame_ts": last_frame_ts,
-                        "status": "suspicious",
-                        "confidence": result.confidence,
-                        "vlm_response": vlm_response,
-                        "frames_analyzed": frames_available,
-                    })
-                    return
-                logger.info(
-                    f"Entity {person_id}: VLM did not confirm "
-                    f"(vlm_confirmed={result.vlm_confirmed})"
-                )
+                # Mark visit as alerted — subsequent requests short-circuit.
+                visit.alerted = True
+                visit.alert_confidence = result.confidence
+                visit.alert_vlm_response = vlm_response
+
                 self.publish_result({
                     "person_id": person_id, "region_id": region_id,
                     "entry_timestamp": entry_timestamp, "scene_id": scene_id,
                     "last_frame_ts": last_frame_ts,
-                    "status": "no_match",
+                    "status": "suspicious",
                     "confidence": result.confidence,
                     "vlm_response": vlm_response,
-                    "frames_analyzed": frames_available,
+                    "frames_analyzed": len(visit.poses),
                 })
                 return
 
@@ -324,7 +404,7 @@ class BAQueueConsumer:
                 "status": "no_match",
                 "confidence": result.confidence,
                 "vlm_response": None,
-                "frames_analyzed": frames_available,
+                "frames_analyzed": len(visit.poses),
             })
         except Exception:
-            logger.exception(f"Error analysing batch for {person_id}")
+            logger.exception(f"Error analysing incremental batch for {person_id}")

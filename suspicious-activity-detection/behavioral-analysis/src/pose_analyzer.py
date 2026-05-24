@@ -49,6 +49,7 @@ class Pose:
     keypoints: np.ndarray  # Shape: [17, 2] - x, y coordinates
     confidences: np.ndarray  # Shape: [17] - confidence per keypoint
     timestamp: Optional[int] = None
+    bbox: Optional[tuple[int, int, int, int]] = None  # (x1, y1, x2, y2) in original image coords
 
     def get_keypoint(self, idx: int) -> tuple[float, float, float]:
         """Get keypoint (x, y, confidence)."""
@@ -213,6 +214,7 @@ class PoseAnalyzer:
         self,
         frames: list[tuple[np.ndarray, int]],
         pose_result: PatternResult,
+        poses: Optional[list["Pose"]] = None,
         frame_key_prefix: str = "",
     ) -> PatternResult:
         """
@@ -226,6 +228,7 @@ class PoseAnalyzer:
         Args:
             frames: List of (frame_image, timestamp) tuples
             pose_result: The result from pose-based detection
+            poses: List of Pose objects with bbox for person-region cropping
 
         Returns:
             Updated PatternResult with VLM confirmation
@@ -245,16 +248,29 @@ class PoseAnalyzer:
             logger.warning(f"No VLM prompt configured for pattern {pose_result.pattern_id}")
             return pose_result
 
-        # Sample frames for VLM — prefer key_frames from pose detection
+        # Select frames deterministically: first frame (shelf grab) + last (n-1) frames (concealment)
         num_frames = vlm_cfg.get("num_frames", 4)
-        if pose_result.key_frames:
-            key_indices = pose_result.key_frames
+        if pose_result.key_frames and poses:
+            # key_frames are indices into the poses list, not the frames list.
+            # Map pose indices → frame indices via timestamp matching.
+            frame_ts_to_idx = {int(f[1]): i for i, f in enumerate(frames)}
+            key_poses = [poses[i] for i in pose_result.key_frames if i < len(poses)]
+            key_frame_list = []
+            for p in key_poses:
+                if p.timestamp and p.timestamp in frame_ts_to_idx:
+                    idx = frame_ts_to_idx[p.timestamp]
+                    key_frame_list.append(frames[idx])
+            if not key_frame_list:
+                key_frame_list = [frames[i] for i in pose_result.key_frames if i < len(frames)]
+            sampled = self._select_deterministic(key_frame_list, num_frames)
+        elif pose_result.key_frames:
             key_frame_list = [
-                frames[i] for i in key_indices if i < len(frames)
+                frames[i] for i in pose_result.key_frames if i < len(frames)
             ]
-            sampled = self._sample_frames(key_frame_list, num_frames)
+            sampled = self._select_deterministic(key_frame_list, num_frames)
         else:
-            sampled = self._sample_frames(frames, num_frames)
+            sampled = self._select_deterministic(frames, num_frames)
+
         frame_images = [f[0] for f in sampled]
         sampled_ts = [int(f[1]) for f in sampled]
         sampled_keys = (
@@ -262,11 +278,15 @@ class PoseAnalyzer:
             if frame_key_prefix else []
         )
 
+        # Crop frames to person region for higher effective resolution
+        frame_images = self._crop_person_regions(frame_images, sampled_ts, poses)
+
         logger.info(
             "Sending %d frames to VLM for pattern '%s' "
-            "(input_pool=%d, sampled_keys=%s)",
+            "(input_pool=%d, sampled_keys=%s, cropped=%s)",
             len(frame_images), pose_result.pattern_id,
             len(frames), sampled_keys or sampled_ts,
+            poses is not None,
         )
 
         vlm_result = await self.vlm_client.analyze(frame_images, prompt)
@@ -285,6 +305,15 @@ class PoseAnalyzer:
         vlm_suspicious = parsed.get("suspicious", False) if parsed else False
         vlm_confidence = parsed.get("confidence", 0.0) if parsed else 0.0
         vlm_reasoning = parsed.get("reasoning", "") if parsed else ""
+
+        # Require minimum VLM confidence to confirm alert
+        vlm_conf_threshold = vlm_cfg.get("confidence_threshold", 0.7)
+        if vlm_suspicious and vlm_confidence < vlm_conf_threshold:
+            logger.info(
+                "VLM said suspicious but confidence %.2f < threshold %.2f, treating as not confirmed",
+                vlm_confidence, vlm_conf_threshold,
+            )
+            vlm_suspicious = False
 
         pose_result.vlm_confirmed = vlm_suspicious
 
@@ -312,12 +341,89 @@ class PoseAnalyzer:
         return pose_result
 
     @staticmethod
-    def _sample_frames(
+    def _select_deterministic(
         frames: list[tuple[np.ndarray, int]],
         n: int,
     ) -> list[tuple[np.ndarray, int]]:
-        """Evenly sample n frames from a sequence."""
+        """Deterministically select n frames: first + last (n-1).
+
+        Ensures VLM sees both the shelf-grab moment (first key frame)
+        and the concealment moment (last key frames). No randomness.
+        """
         if len(frames) <= n:
             return frames
-        indices = np.linspace(0, len(frames) - 1, n, dtype=int)
-        return [frames[i] for i in indices]
+        # First frame (Phase 1: hand at shelf) + last (n-1) frames (Phase 2: concealment)
+        return [frames[0]] + frames[-(n - 1):]
+
+    @staticmethod
+    def _crop_person_regions(
+        frame_images: list[np.ndarray],
+        timestamps: list[int],
+        poses: Optional[list["Pose"]],
+        padding_ratio: float = 0.25,
+    ) -> list[np.ndarray]:
+        """Crop each frame to the person bounding box for higher VLM resolution.
+
+        Uses pose bbox matched by timestamp. Falls back to full frame if no
+        matching pose/bbox is found.
+
+        Args:
+            frame_images: BGR numpy arrays (full camera frames).
+            timestamps: Timestamp for each frame (used to match with poses).
+            poses: Pose objects containing bbox from YOLO detection.
+            padding_ratio: Extra padding around bbox as fraction of bbox size.
+
+        Returns:
+            List of cropped (or original) BGR numpy arrays.
+        """
+        if not poses:
+            return frame_images
+
+        # Build timestamp → bbox lookup from poses
+        ts_to_bbox: dict[int, tuple[int, int, int, int]] = {}
+        for pose in poses:
+            if pose.timestamp is not None and pose.bbox is not None:
+                ts_to_bbox[pose.timestamp] = pose.bbox
+
+        cropped = []
+        for img, ts in zip(frame_images, timestamps):
+            bbox = ts_to_bbox.get(ts)
+            if bbox is None:
+                # No matching pose — try closest timestamp within 100ms
+                closest_ts = min(
+                    (t for t in ts_to_bbox if abs(t - ts) < 100),
+                    key=lambda t: abs(t - ts),
+                    default=None,
+                )
+                if closest_ts is not None:
+                    bbox = ts_to_bbox[closest_ts]
+
+            if bbox is None:
+                cropped.append(img)
+                continue
+
+            h, w = img.shape[:2]
+            x1, y1, x2, y2 = bbox
+            bw, bh = x2 - x1, y2 - y1
+
+            # Add padding around person bbox
+            pad_x = int(bw * padding_ratio)
+            pad_y = int(bh * padding_ratio)
+            x1 = max(0, x1 - pad_x)
+            y1 = max(0, y1 - pad_y)
+            x2 = min(w, x2 + pad_x)
+            y2 = min(h, y2 + pad_y)
+
+            # Minimum crop size sanity check (avoid tiny/degenerate crops)
+            if (x2 - x1) < 50 or (y2 - y1) < 50:
+                logger.debug("Crop too small (%dx%d), using full frame", x2 - x1, y2 - y1)
+                cropped.append(img)
+                continue
+
+            logger.debug(
+                "Cropped frame ts=%d: full=%dx%d → crop=%dx%d (bbox=%s)",
+                ts, w, h, x2 - x1, y2 - y1, (x1, y1, x2, y2),
+            )
+            cropped.append(img[y1:y2, x1:x2])
+
+        return cropped

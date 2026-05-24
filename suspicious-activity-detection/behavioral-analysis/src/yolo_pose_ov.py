@@ -31,6 +31,7 @@ class _KeypointsResult:
 
     xy: np.ndarray  # Shape: [num_persons, 17, 2]
     conf: np.ndarray  # Shape: [num_persons, 17]
+    boxes: np.ndarray  # Shape: [num_persons, 4] — (x1, y1, x2, y2) in original coords
 
 
 @dataclass
@@ -133,6 +134,13 @@ class YOLOPoseOV:
         order = detections[:, 4].argsort()[::-1]
         detections = detections[order]
 
+        # Extract bounding boxes — columns 0:4 (x1, y1, x2, y2) in letterbox coords
+        raw_boxes = detections[:, :4].copy()
+        raw_boxes[:, 0] = (raw_boxes[:, 0] - pad_w) / ratio
+        raw_boxes[:, 1] = (raw_boxes[:, 1] - pad_h) / ratio
+        raw_boxes[:, 2] = (raw_boxes[:, 2] - pad_w) / ratio
+        raw_boxes[:, 3] = (raw_boxes[:, 3] - pad_h) / ratio
+
         # Extract keypoints — columns 6..57 → (N, 17, 3)
         raw_kp = detections[:, 6:].reshape(-1, 17, 3)
         kp_xy = raw_kp[:, :, :2].copy()
@@ -142,4 +150,4 @@ class YOLOPoseOV:
         kp_xy[:, :, 0] = (kp_xy[:, :, 0] - pad_w) / ratio
         kp_xy[:, :, 1] = (kp_xy[:, :, 1] - pad_h) / ratio
 
-        return [_PoseResult(keypoints=_KeypointsResult(xy=kp_xy, conf=kp_conf))]
+        return [_PoseResult(keypoints=_KeypointsResult(xy=kp_xy, conf=kp_conf, boxes=raw_boxes))]
