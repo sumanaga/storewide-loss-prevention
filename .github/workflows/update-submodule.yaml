@@ -20,6 +20,7 @@ jobs:
         with:
           token: ${{ secrets.SSO_TOKEN }}
           submodules: recursive
+          lfs: true
       - name: Authorize Git
         run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
